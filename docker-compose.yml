@@ -1,0 +1,334 @@
+version: "3.9"
+
+networks:
+  nerve:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  neo4j_data:
+  vault_data:
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # ── Infra ──────────────────────────────────────────────────
+
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: nerve-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-nerve}
+      POSTGRES_USER: ${POSTGRES_USER:-nerve}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nerve_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports: ["5432:5432"]
+    networks: [nerve]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nerve}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.0
+    container_name: nerve-pgbouncer
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-nerve}:${POSTGRES_PASSWORD:-nerve_secret}@postgres:5432/${POSTGRES_DB:-nerve}
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 20
+    ports: ["6432:5432"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+
+  redis:
+    image: redis:7-alpine
+    container_name: nerve-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes: [redis_data:/data]
+    ports: ["6379:6379"]
+    networks: [nerve]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: nerve-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-nerve_neo4j}
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+    volumes: [neo4j_data:/data]
+    ports: ["7474:7474", "7687:7687"]
+    networks: [nerve]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  vault:
+    image: hashicorp/vault:1.16
+    container_name: nerve-vault
+    command: server -dev -dev-root-token-id=root
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    cap_add: [IPC_LOCK]
+    volumes: [vault_data:/vault/data]
+    ports: ["8200:8200"]
+    networks: [nerve]
+
+  opa:
+    image: openpolicyagent/opa:latest-rootless
+    container_name: nerve-opa
+    command: run --server --log-level=info /policies
+    volumes: [./policies:/policies:ro]
+    ports: ["8181:8181"]
+    networks: [nerve]
+
+  temporal:
+    image: temporalio/auto-setup:1.24
+    container_name: nerve-temporal
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-nerve}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:-nerve_secret}
+      POSTGRES_SEEDS: postgres
+    depends_on:
+      postgres: {condition: service_healthy}
+    ports: ["7233:7233"]
+    networks: [nerve]
+
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    container_name: nerve-temporal-ui
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports: ["8088:8080"]
+    depends_on: [temporal]
+    networks: [nerve]
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: nerve-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports: ["9090:9090"]
+    networks: [nerve]
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: nerve-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: nerve_grafana
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [nerve]
+
+  # ── Microservices ──────────────────────────────────────────
+
+  gateway:
+    build: {context: ./backend/gateway, dockerfile: Dockerfile, target: production}
+    container_name: nerve-gateway
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      VAULT_ADDR: http://vault:8200
+      OPA_URL: http://opa:8181
+      TEMPORAL_HOST: temporal
+    volumes: [./backend/gateway:/app]
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  catalog:
+    build: {context: ./backend/catalog, dockerfile: Dockerfile, target: production}
+    container_name: nerve-catalog
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      VAULT_ADDR: http://vault:8200
+      GATEWAY_URL: http://gateway:8000
+    volumes: [./backend/catalog:/app]
+    ports: ["8001:8001"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+  scaffolding:
+    build: {context: ./backend/scaffolding, dockerfile: Dockerfile, target: production}
+    container_name: nerve-scaffolding
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      VAULT_ADDR: http://vault:8200
+      TEMPORAL_HOST: temporal
+      GATEWAY_URL: http://gateway:8000
+    volumes: [./backend/scaffolding:/app]
+    ports: ["8002:8002"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
+
+  iac:
+    build: {context: ./backend/iac, dockerfile: Dockerfile, target: production}
+    container_name: nerve-iac
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+      VAULT_ADDR: http://vault:8200
+      TEMPORAL_HOST: temporal
+    volumes: [./backend/iac:/app]
+    ports: ["8003:8003"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8003 --reload
+
+  pipelines:
+    build: {context: ./backend/pipelines, dockerfile: Dockerfile, target: production}
+    container_name: nerve-pipelines
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+    volumes: [./backend/pipelines:/app]
+    ports: ["8004:8004"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8004 --reload
+
+  observability:
+    build: {context: ./backend/observability, dockerfile: Dockerfile, target: production}
+    container_name: nerve-observability
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      PROMETHEUS_URL: http://prometheus:9090
+    volumes: [./backend/observability:/app]
+    ports: ["8005:8005"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8005 --reload
+
+  enforcer:
+    build: {context: ./backend/enforcer, dockerfile: Dockerfile, target: production}
+    container_name: nerve-enforcer
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+      OPA_URL: http://opa:8181
+    volumes: [./backend/enforcer:/app]
+    ports: ["8006:8006"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8006 --reload
+
+  blast:
+    build: {context: ./backend/blast, dockerfile: Dockerfile, target: production}
+    container_name: nerve-blast
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+    volumes: [./backend/blast:/app]
+    ports: ["8007:8007"]
+    depends_on:
+      redis: {condition: service_healthy}
+      neo4j: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8007 --reload
+
+  ai:
+    build: {context: ./backend/ai, dockerfile: Dockerfile, target: production}
+    container_name: nerve-ai
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+    volumes: [./backend/ai:/app]
+    ports: ["8008:8008"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8008 --reload
+
+  docs:
+    build: {context: ./backend/docs, dockerfile: Dockerfile, target: production}
+    container_name: nerve-docs
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+    volumes: [./backend/docs:/app]
+    ports: ["8009:8009"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8009 --reload
+
+  quotas:
+    build: {context: ./backend/quotas, dockerfile: Dockerfile, target: production}
+    container_name: nerve-quotas
+    env_file: .env
+    environment:
+      POSTGRES_HOST: pgbouncer
+      POSTGRES_PORT: 5432
+    volumes: [./backend/quotas:/app]
+    ports: ["8010:8010"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [nerve]
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload
